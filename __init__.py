@@ -12,12 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from streamlit.web.server.starlette.starlette_app import App, create_starlette_app
-from streamlit.web.server.starlette.starlette_server import UvicornRunner, UvicornServer
+from streamlit.testing.v1.app_test import AppTest
 
-__all__ = [
-    "App",
-    "UvicornRunner",
-    "UvicornServer",
-    "create_starlette_app",
-]
+__all__ = ["AppTest"]

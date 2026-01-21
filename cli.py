@@ -1,324 +1,468 @@
-"""
-Module version for monitoring CLI pipes (`... | python -m tqdm | ...`).
-"""
-import logging
-import re
+# Copyright (c) Streamlit Inc. (2018-2022) Snowflake Inc. (2022-2026)
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""A script which is run when the Streamlit package is executed."""
+
+from __future__ import annotations
+
+import os
 import sys
-from ast import literal_eval as numeric
-from textwrap import indent
+from collections.abc import Callable
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Final, TypeVar
 
-from .std import TqdmKeyError, TqdmTypeError, tqdm
-from .version import __version__
+# We cannot lazy-load click here because its used via decorators.
+import click
 
-__all__ = ["main"]
-log = logging.getLogger(__name__)
+from streamlit import config as _config
+from streamlit.runtime import caching
+from streamlit.runtime.credentials import Credentials, check_credentials
+from streamlit.web import bootstrap
+from streamlit.web.cache_storage_manager_config import (
+    create_default_cache_storage_manager,
+)
+
+if TYPE_CHECKING:
+    from streamlit.config_option import ConfigOption
+
+ACCEPTED_FILE_EXTENSIONS: Final = ("py", "py3")
+
+LOG_LEVELS: Final = ("error", "warning", "info", "debug")
 
 
-def cast(val, typ):
-    log.debug((val, typ))
-    if " or " in typ:
-        for t in typ.split(" or "):
-            try:
-                return cast(val, t)
-            except TqdmTypeError:
-                pass
-        raise TqdmTypeError(f"{val} : {typ}")
+def _convert_config_option_to_click_option(
+    config_option: ConfigOption,
+) -> dict[str, Any]:
+    """Composes given config option options as options for click lib."""
+    option = f"--{config_option.key}"
+    param = config_option.key.replace(".", "_")
+    description = config_option.description
+    if config_option.deprecated:
+        if description is None:
+            description = ""
+        description += (
+            f"\n {config_option.deprecation_text} - {config_option.expiration_date}"
+        )
 
-    # sys.stderr.write('\ndebug | `val:type`: `' + val + ':' + typ + '`.\n')
-    if typ == 'bool':
-        if (val == 'True') or (val == ''):
-            return True
-        if val == 'False':
-            return False
-        raise TqdmTypeError(val + ' : ' + typ)
-    if typ == 'chr':
-        if len(val) == 1:
-            return val.encode()
-        if re.match(r"^\\\w+$", val):
-            return eval(f'"{val}"').encode()
-        raise TqdmTypeError(f"{val} : {typ}")
-    if typ == 'str':
-        return val
-    if typ == 'int':
+    return {
+        "param": param,
+        "description": description,
+        "type": config_option.type,
+        "option": option,
+        "envvar": config_option.env_var,
+        "multiple": config_option.multiple,
+    }
+
+
+def _make_sensitive_option_callback(
+    config_option: ConfigOption,
+) -> Callable[[click.Context, click.Parameter, Any], None]:
+    def callback(_ctx: click.Context, _param: click.Parameter, cli_value: Any) -> None:
+        if cli_value is None:
+            return
+        raise SystemExit(
+            f"Setting {config_option.key!r} option using the CLI flag is not allowed. "
+            f"Set this option in the configuration file or environment "
+            f"variable: {config_option.env_var!r}"
+        )
+
+    return callback
+
+
+F = TypeVar("F", bound=Callable[..., Any])
+
+
+def configurator_options(func: F) -> F:
+    """Decorator that adds config param keys to click dynamically."""
+    for _, value in reversed(_config._config_options_template.items()):
+        parsed_parameter = _convert_config_option_to_click_option(value)
+        if value.sensitive:
+            # Display a warning if the user tries to set sensitive
+            # options using the CLI and exit with non-zero code.
+            click_option_kwargs = {
+                "expose_value": False,
+                "hidden": True,
+                "is_eager": True,
+                "callback": _make_sensitive_option_callback(value),
+            }
+        else:
+            click_option_kwargs = {
+                "show_envvar": True,
+                "envvar": parsed_parameter["envvar"],
+            }
+        config_option = click.option(
+            parsed_parameter["option"],
+            parsed_parameter["param"],
+            help=parsed_parameter["description"],
+            type=parsed_parameter["type"],
+            multiple=parsed_parameter["multiple"],
+            **click_option_kwargs,  # type: ignore
+        )
+        func = config_option(func)
+    return func
+
+
+def _download_remote(main_script_path: str, url_path: str) -> None:
+    """Fetch remote file at url_path to main_script_path."""
+    import requests
+    from requests.exceptions import RequestException
+
+    with open(main_script_path, "wb") as fp:
         try:
-            return int(val)
-        except ValueError as exc:
-            raise TqdmTypeError(f"{val} : {typ}") from exc
-    if typ == 'float':
-        try:
-            return float(val)
-        except ValueError as exc:
-            raise TqdmTypeError(f"{val} : {typ}") from exc
-    raise TqdmTypeError(f"{val} : {typ}")
+            resp = requests.get(url_path, timeout=30)
+            resp.raise_for_status()
+            fp.write(resp.content)
+        except RequestException as e:
+            raise click.BadParameter(f"Unable to fetch {url_path}.\n{e}")
 
 
-def posix_pipe(fin, fout, delim=b'\\n', buf_size=256,
-               callback=lambda float: None, callback_len=True):
+@click.group(context_settings={"auto_envvar_prefix": "STREAMLIT"})
+@click.option("--log_level", show_default=True, type=click.Choice(LOG_LEVELS))
+@click.version_option(prog_name="Streamlit")
+def main(log_level: str = "info") -> None:
+    """Try out a demo with:
+
+        $ streamlit hello
+
+    Or use the line below to run your own script:
+
+        $ streamlit run your_script.py
+    """  # noqa: D400
+
+    if log_level:
+        from streamlit.logger import get_logger
+
+        logger: Final = get_logger(__name__)
+        logger.warning(
+            "Setting the log level using the --log_level flag is unsupported."
+            "\nUse the --logger.level flag (after your streamlit command) instead."
+        )
+
+
+@main.command("help")
+def help() -> None:  # noqa: A001
+    """Print this help message."""
+    # We use _get_command_line_as_string to run some error checks but don't do
+    # anything with its return value.
+    _get_command_line_as_string()
+
+    # Pretend user typed 'streamlit --help' instead of 'streamlit help'.
+    sys.argv[1] = "--help"
+    main(prog_name="streamlit")
+
+
+@main.command("version")
+def main_version() -> None:
+    """Print Streamlit's version number."""
+    # Pretend user typed 'streamlit --version' instead of 'streamlit version'
+    import sys
+
+    # We use _get_command_line_as_string to run some error checks but don't do
+    # anything with its return value.
+    _get_command_line_as_string()
+
+    sys.argv[1] = "--version"
+    main()
+
+
+@main.command("docs")
+def main_docs() -> None:
+    """Show help in browser."""
+    click.echo("Showing help page in browser...")
+    from streamlit import cli_util
+
+    cli_util.open_browser("https://docs.streamlit.io")
+
+
+@main.command("hello")
+@configurator_options
+def main_hello(**kwargs: Any) -> None:
+    """Runs the Hello World script."""
+    from streamlit.hello import streamlit_app
+
+    filename = streamlit_app.__file__
+    _main_run(filename, flag_options=kwargs)
+
+
+@main.command("run")
+@configurator_options
+@click.argument("target", default="streamlit_app.py", envvar="STREAMLIT_RUN_TARGET")
+@click.argument("args", nargs=-1)
+def main_run(target: str, args: list[str] | None = None, **kwargs: Any) -> None:
+    """Run a Python script, piping stderr to Streamlit.
+
+    If omitted, the target script will be assumed to be "streamlit_app.py".
+
+    Otherwise, the target script should be one of the following:
+    - The path to a local Python file.
+    - The path to a local folder where "streamlit_app.py" can be found.
+    - A URL pointing to a Python file. In this case Streamlit will download the
+      file to a temporary file and run it.
+
+    To pass command-line arguments to the script, add " -- " before them. For example:
+
+        $ streamlit run my_app.py -- --my_arg1=123 my_arg2
+                                   ↑
+                                   Your CLI args start after this.
     """
-    Params
-    ------
-    fin  : binary file with `read(buf_size : int)` method
-    fout  : binary file with `write` (and optionally `flush`) methods.
-    callback  : function(float), e.g.: `tqdm.update`
-    callback_len  : If (default: True) do `callback(len(buffer))`.
-      Otherwise, do `callback(data) for data in buffer.split(delim)`.
-    """
-    fp_write = fout.write
+    from streamlit import url_util
 
-    if not delim:
-        while True:
-            tmp = fin.read(buf_size)
+    if url_util.is_url(target):
+        from streamlit.temporary_directory import TemporaryDirectory
 
-            # flush at EOF
-            if not tmp:
-                getattr(fout, 'flush', lambda: None)()
-                return
+        with TemporaryDirectory() as temp_dir:
+            from urllib.parse import urlparse
 
-            fp_write(tmp)
-            callback(len(tmp))
-        # return
+            url_subpath = urlparse(target).path
 
-    buf = b''
-    len_delim = len(delim)
-    # n = 0
-    while True:
-        tmp = fin.read(buf_size)
+            _check_extension_or_raise(url_subpath)
 
-        # flush at EOF
-        if not tmp:
-            if buf:
-                fp_write(buf)
-                if callback_len:
-                    # n += 1 + buf.count(delim)
-                    callback(1 + buf.count(delim))
-                else:
-                    for i in buf.split(delim):
-                        callback(i)
-            getattr(fout, 'flush', lambda: None)()
-            return  # n
+            main_script_path = os.path.join(
+                temp_dir, url_subpath.strip("/").rsplit("/", 1)[-1]
+            )
+            # if this is a GitHub/Gist blob url, convert to a raw URL first.
+            url = url_util.process_gitblob_url(target)
+            _download_remote(main_script_path, url)
+            _main_run(main_script_path, args, flag_options=kwargs)
 
-        while True:
-            i = tmp.find(delim)
-            if i < 0:
-                buf += tmp
-                break
-            fp_write(buf + tmp[:i + len(delim)])
-            # n += 1
-            callback(1 if callback_len else (buf + tmp[:i]))
-            buf = b''
-            tmp = tmp[i + len_delim:]
-
-
-# ((opt, type), ... )
-RE_OPTS = re.compile(r'\n {4}(\S+)\s{2,}:\s*([^,]+)')
-# better split method assuming no positional args
-RE_SHLEX = re.compile(r'\s*(?<!\S)--?([^\s=]+)(\s+|=|$)')
-
-# TODO: add custom support for some of the following?
-UNSUPPORTED_OPTS = ('iterable', 'gui', 'out', 'file')
-
-# The 8 leading spaces are required for consistency
-CLI_EXTRA_DOC = r"""
-    Extra CLI Options
-    -----------------
-    name  : type, optional
-        TODO: find out why this is needed.
-    delim  : chr, optional
-        Delimiting character [default: '\n']. Use '\0' for null.
-        N.B.: on Windows systems, Python converts '\n' to '\r\n'.
-    buf_size  : int, optional
-        String buffer size in bytes [default: 256]
-        used when `delim` is specified.
-    bytes  : bool, optional
-        If true, will count bytes, ignore `delim`, and default
-        `unit_scale` to True, `unit_divisor` to 1024, and `unit` to 'B'.
-    tee  : bool, optional
-        If true, passes `stdin` to both `stderr` and `stdout`.
-    update  : bool, optional
-        If true, will treat input as newly elapsed iterations,
-        i.e. numbers to pass to `update()`. Note that this is slow
-        (~2e5 it/s) since every input must be decoded as a number.
-    update_to  : bool, optional
-        If true, will treat input as total elapsed iterations,
-        i.e. numbers to assign to `self.n`. Note that this is slow
-        (~2e5 it/s) since every input must be decoded as a number.
-    null  : bool, optional
-        If true, will discard input (no stdout).
-    manpath  : str, optional
-        Directory in which to install tqdm man pages.
-    comppath  : str, optional
-        Directory in which to place tqdm completion.
-    log  : str, optional
-        CRITICAL|FATAL|ERROR|WARN(ING)|[default: 'INFO']|DEBUG|NOTSET.
-"""
-
-
-def main(fp=sys.stderr, argv=None):
-    """
-    Parameters (internal use only)
-    ---------
-    fp  : file-like object for tqdm
-    argv  : list (default: sys.argv[1:])
-    """
-    if argv is None:
-        argv = sys.argv[1:]
-    try:
-        log_idx = argv.index('--log')
-    except ValueError:
-        for i in argv:
-            if i.startswith('--log='):
-                logLevel = i[len('--log='):]
-                break
-        else:
-            logLevel = 'INFO'
     else:
-        # argv.pop(log_idx)
-        # logLevel = argv.pop(log_idx)
-        logLevel = argv[log_idx + 1]
-    logging.basicConfig(level=getattr(logging, logLevel),
-                        format="%(levelname)s:%(module)s:%(lineno)d:%(message)s")
+        path = Path(target)
 
-    # py<3.13 doesn't dedent docstrings
-    d = (tqdm.__doc__ if sys.version_info < (3, 13)
-         else indent(tqdm.__doc__, "    ")) + CLI_EXTRA_DOC
+        if path.is_dir():
+            path /= "streamlit_app.py"
 
-    opt_types = dict(RE_OPTS.findall(d))
-    # opt_types['delim'] = 'chr'
+        path_str = str(path)
+        _check_extension_or_raise(path_str)
 
-    for o in UNSUPPORTED_OPTS:
-        opt_types.pop(o)
+        if not path.exists():
+            raise click.BadParameter(f"File does not exist: {path}")
 
-    log.debug(sorted(opt_types.items()))
+        _main_run(path_str, args, flag_options=kwargs)
 
-    # d = RE_OPTS.sub(r'  --\1=<\1>  : \2', d)
-    split = RE_OPTS.split(d)
-    opt_types_desc = zip(split[1::3], split[2::3], split[3::3])
-    d = ''.join(('\n  --{0}  : {2}{3}' if otd[1] == 'bool' else
-                 '\n  --{0}=<{1}>  : {2}{3}').format(
-                     otd[0].replace('_', '-'), otd[0], *otd[1:])
-                for otd in opt_types_desc if otd[0] not in UNSUPPORTED_OPTS)
 
-    help_short = "Usage:\n  tqdm [--help | options]\n"
-    d = help_short + """
-Options:
-  -h, --help     Print this help and exit.
-  -v, --version  Print version and exit.
-""" + d.strip('\n') + '\n'
+def _check_extension_or_raise(path_str: str) -> None:
+    _, extension = os.path.splitext(path_str)
 
-    # opts = docopt(d, version=__version__)
-    if any(v in argv for v in ('-v', '--version')):
-        sys.stdout.write(__version__ + '\n')
-        sys.exit(0)
-    elif any(v in argv for v in ('-h', '--help')):
-        sys.stdout.write(d + '\n')
-        sys.exit(0)
-    elif argv and argv[0][:2] != '--':
-        sys.stderr.write(f"Error:Unknown argument:{argv[0]}\n{help_short}")
+    if extension[1:] not in ACCEPTED_FILE_EXTENSIONS:
+        if extension[1:] == "":
+            raise click.BadArgumentUsage(
+                "Streamlit requires raw Python (.py) files, but the provided file has no extension.\n"
+                "For more information, please see https://docs.streamlit.io"
+            )
+        raise click.BadArgumentUsage(
+            f"Streamlit requires raw Python (.py) files, not {extension}.\n"
+            "For more information, please see https://docs.streamlit.io"
+        )
 
-    argv = RE_SHLEX.split(' '.join(["tqdm"] + argv))
-    opts = dict(zip(argv[1::3], argv[3::3]))
 
-    log.debug(opts)
-    opts.pop('log', True)
+def _get_command_line_as_string() -> str | None:
+    import subprocess
 
-    tqdm_args = {'file': fp}
-    try:
-        for (o, v) in opts.items():
-            o = o.replace('-', '_')
-            try:
-                tqdm_args[o] = cast(v, opt_types[o])
-            except KeyError as e:
-                raise TqdmKeyError(str(e))
-        log.debug('args:' + str(tqdm_args))
+    parent = click.get_current_context().parent
+    if parent is None:
+        return None
 
-        delim_per_char = tqdm_args.pop('bytes', False)
-        update = tqdm_args.pop('update', False)
-        update_to = tqdm_args.pop('update_to', False)
-        if sum((delim_per_char, update, update_to)) > 1:
-            raise TqdmKeyError("Can only have one of --bytes --update --update_to")
-    except Exception:
-        fp.write("\nError:\n" + help_short)
-        stdin, stdout_write = sys.stdin, sys.stdout.write
-        for i in stdin:
-            stdout_write(i)
-        raise
+    if "streamlit.cli" in parent.command_path:
+        raise RuntimeError(
+            "Running streamlit via `python -m streamlit.cli <command>` is"
+            " unsupported. Please use `python -m streamlit <command>` instead."
+        )
+
+    cmd_line_as_list = [parent.command_path]
+    cmd_line_as_list.extend(sys.argv[1:])
+    return subprocess.list2cmdline(cmd_line_as_list)
+
+
+def _main_run(
+    file: str,
+    args: list[str] | None = None,
+    flag_options: dict[str, Any] | None = None,
+) -> None:
+    # Set the main script path to use it for config & secret files
+    # While its a bit suboptimal, we need to store this into a module-level
+    # variable before we load the config options via `load_config_options`
+    main_script_path = os.path.abspath(file)
+    _config._main_script_path = main_script_path
+
+    bootstrap.load_config_options(flag_options=flag_options or {})
+    if args is None:
+        args = []
+
+    if flag_options is None:
+        flag_options = {}
+
+    check_credentials()
+
+    # Check if the script contains an ASGI app instance (st.App, FastAPI, Starlette).
+    # This intentionally supports non-Streamlit ASGI frameworks to enable `streamlit run`
+    # as a unified entry point for projects that combine Streamlit with other frameworks.
+    from streamlit.web.server.app_discovery import discover_asgi_app
+
+    discovery_result = discover_asgi_app(Path(main_script_path))
+
+    if discovery_result.is_asgi_app:
+        # Run as ASGI app with uvicorn
+        bootstrap.run_asgi_app(
+            main_script_path,
+            discovery_result.import_string,  # type: ignore[arg-type]
+            args,
+            flag_options,
+        )
     else:
-        buf_size = tqdm_args.pop('buf_size', 256)
-        delim = tqdm_args.pop('delim', b'\\n')
-        tee = tqdm_args.pop('tee', False)
-        manpath = tqdm_args.pop('manpath', None)
-        comppath = tqdm_args.pop('comppath', None)
-        if tqdm_args.pop('null', False):
-            class stdout(object):
-                @staticmethod
-                def write(_):
-                    pass
-        else:
-            stdout = sys.stdout
-            stdout = getattr(stdout, 'buffer', stdout)
-        stdin = getattr(sys.stdin, 'buffer', sys.stdin)
-        if manpath or comppath:
-            try:  # py<3.9
-                import importlib_resources as resources
-            except ImportError:
-                from importlib import resources
-            from pathlib import Path
+        # Run as traditional Streamlit app
+        is_hello = _get_command_line_as_string() == "streamlit hello"
+        bootstrap.run(main_script_path, is_hello, args, flag_options)
 
-            def cp(name, dst):
-                """copy resource `name` to `dst`"""
-                fi = resources.files('tqdm') / name
-                dst.write_bytes(fi.read_bytes())
-                log.info("written:%s", dst)
-            if manpath is not None:
-                cp('tqdm.1', Path(manpath) / 'tqdm.1')
-            if comppath is not None:
-                cp('completion.sh', Path(comppath) / 'tqdm_completion.sh')
-            sys.exit(0)
-        if tee:
-            stdout_write = stdout.write
-            fp_write = getattr(fp, 'buffer', fp).write
 
-            class stdout(object):  # pylint: disable=function-redefined
-                @staticmethod
-                def write(x):
-                    with tqdm.external_write_mode(file=fp):
-                        fp_write(x)
-                    stdout_write(x)
-        if delim_per_char:
-            tqdm_args.setdefault('unit', 'B')
-            tqdm_args.setdefault('unit_scale', True)
-            tqdm_args.setdefault('unit_divisor', 1024)
-            log.debug(tqdm_args)
-            with tqdm(**tqdm_args) as t:
-                posix_pipe(stdin, stdout, '', buf_size, t.update)
-        elif delim == b'\\n':
-            log.debug(tqdm_args)
-            write = stdout.write
-            if update or update_to:
-                with tqdm(**tqdm_args) as t:
-                    if update:
-                        def callback(i):
-                            t.update(numeric(i.decode()))
-                    else:  # update_to
-                        def callback(i):
-                            t.update(numeric(i.decode()) - t.n)
-                    for i in stdin:
-                        write(i)
-                        callback(i)
-            else:
-                for i in tqdm(stdin, **tqdm_args):
-                    write(i)
-        else:
-            log.debug(tqdm_args)
-            with tqdm(**tqdm_args) as t:
-                callback_len = False
-                if update:
-                    def callback(i):
-                        t.update(numeric(i.decode()))
-                elif update_to:
-                    def callback(i):
-                        t.update(numeric(i.decode()) - t.n)
-                else:
-                    callback = t.update
-                    callback_len = True
-                posix_pipe(stdin, stdout, delim, buf_size, callback, callback_len)
+# SUBCOMMAND cache
+
+
+@main.group("cache")
+def cache() -> None:
+    """Manage the Streamlit cache."""
+    pass
+
+
+@cache.command("clear")
+def cache_clear() -> None:
+    """Clear st.cache_data and st.cache_resource caches."""
+
+    # in this `streamlit cache clear` cli command we cannot use the
+    # `cache_storage_manager from runtime (since runtime is not initialized)
+    # so we create a new cache_storage_manager instance that used in runtime,
+    # and call clear_all() method for it.
+    # This will not remove the in-memory cache.
+    cache_storage_manager = create_default_cache_storage_manager()
+    cache_storage_manager.clear_all()
+    caching.cache_resource.clear()
+
+
+# SUBCOMMAND config
+
+
+@main.group("config")
+def config() -> None:
+    """Manage Streamlit's config settings."""
+    pass
+
+
+@config.command("show")
+@configurator_options
+def config_show(**kwargs: Any) -> None:
+    """Show all of Streamlit's config settings."""
+
+    bootstrap.load_config_options(flag_options=kwargs)
+
+    _config.show_config()
+
+
+# SUBCOMMAND activate
+
+
+@main.group("activate", invoke_without_command=True)
+@click.pass_context
+def activate(ctx: click.Context) -> None:
+    """Activate Streamlit by entering your email."""
+    if not ctx.invoked_subcommand:
+        Credentials.get_current().activate()
+
+
+@activate.command("reset")
+def activate_reset() -> None:
+    """Reset Activation Credentials."""
+    Credentials.get_current().reset()
+
+
+# SUBCOMMAND test
+
+
+@main.group("test", hidden=True)
+def test() -> None:
+    """Internal-only commands used for testing.
+
+    These commands are not included in the output of `streamlit help`.
+    """
+    pass
+
+
+@test.command("prog_name")
+def test_prog_name() -> None:
+    """Assert that the program name is set to `streamlit test`.
+
+    This is used by our cli-smoke-tests to verify that the program name is set
+    to `streamlit ...` whether the streamlit binary is invoked directly or via
+    `python -m streamlit ...`.
+    """
+    # We use _get_command_line_as_string to run some error checks but don't do
+    # anything with its return value.
+    _get_command_line_as_string()
+
+    parent = click.get_current_context().parent
+
+    if parent is None:
+        raise AssertionError("parent is None")
+
+    if parent.command_path != "streamlit test":
+        raise AssertionError(
+            f"Parent command path is {parent.command_path} not streamlit test."
+        )
+
+
+@main.command("init")
+@click.argument("directory", required=False)
+def main_init(directory: str | None = None) -> None:
+    """Initialize a new Streamlit project.
+
+    If DIRECTORY is specified, create it and initialize the project there.
+    Otherwise use the current directory.
+    """
+    from pathlib import Path
+
+    project_dir = Path(directory) if directory else Path.cwd()
+
+    try:
+        project_dir.mkdir(exist_ok=True, parents=True)
+    except OSError as e:
+        raise click.ClickException(f"Failed to create directory: {e}")
+
+    # Create requirements.txt
+    (project_dir / "requirements.txt").write_text("streamlit\n", encoding="utf-8")
+
+    # Create streamlit_app.py
+    (project_dir / "streamlit_app.py").write_text(
+        """import streamlit as st
+
+st.title("🎈 My new app")
+st.write(
+    "Let's start building! For help and inspiration, head over to [docs.streamlit.io](https://docs.streamlit.io/)."
+)
+""",
+        encoding="utf-8",
+    )
+
+    rel_path_str = str(directory) if directory else "."
+
+    click.secho("✨ Created new Streamlit app in ", nl=False)
+    click.secho(f"{rel_path_str}", fg="blue")
+    click.echo("🚀 Run it with: ", nl=False)
+    click.secho(f"streamlit run {rel_path_str}/streamlit_app.py", fg="blue")
+
+    if click.confirm("❓ Run the app now?", default=True):
+        app_path = project_dir / "streamlit_app.py"
+        click.echo("\nStarting Streamlit...")
+        _main_run(str(app_path))
+
+
+if __name__ == "__main__":
+    main()

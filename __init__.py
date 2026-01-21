@@ -1,25 +1,23 @@
-"""Python module which parses and emits TOML.
+# Copyright (c) Streamlit Inc. (2018-2022) Snowflake Inc. (2022-2026)
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
-Released under the MIT license.
-"""
+from streamlit.web.server.starlette.starlette_app import App, create_starlette_app
+from streamlit.web.server.starlette.starlette_server import UvicornRunner, UvicornServer
 
-from toml import encoder
-from toml import decoder
-
-__version__ = "0.10.2"
-_spec_ = "0.5.0"
-
-load = decoder.load
-loads = decoder.loads
-TomlDecoder = decoder.TomlDecoder
-TomlDecodeError = decoder.TomlDecodeError
-TomlPreserveCommentDecoder = decoder.TomlPreserveCommentDecoder
-
-dump = encoder.dump
-dumps = encoder.dumps
-TomlEncoder = encoder.TomlEncoder
-TomlArraySeparatorEncoder = encoder.TomlArraySeparatorEncoder
-TomlPreserveInlineDictEncoder = encoder.TomlPreserveInlineDictEncoder
-TomlNumpyEncoder = encoder.TomlNumpyEncoder
-TomlPreserveCommentEncoder = encoder.TomlPreserveCommentEncoder
-TomlPathlibEncoder = encoder.TomlPathlibEncoder
+__all__ = [
+    "App",
+    "UvicornRunner",
+    "UvicornServer",
+    "create_starlette_app",
+]

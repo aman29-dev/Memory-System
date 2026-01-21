@@ -1,0 +1,120 @@
+{
+  "dec_281c4a8c": {
+    "id": "dec_281c4a8c",
+    "title": "choose a language to learn",
+    "description": "i want to learn python language for  devlop my skill",
+    "goal": "To get a job",
+    "constraints": [
+      {
+        "category": "Time",
+        "description": "only 2 month to learn",
+        "severity": "Medium"
+      }
+    ],
+    "alternatives": [
+      {
+        "option": "java",
+        "pros": [
+          "Cost-effective"
+        ],
+        "cons": [
+          "Learning curve"
+        ],
+        "rejected_reason": "i dont have enough knowledge to learn java"
+      }
+    ],
+    "final_choice": "i will learn python",
+    "reasoning": "i choice python as it is easy to learn and also cost effective\n",
+    "expected_outcome": "Be a python job ready programmer",
+    "related_decisions": [],
+    "created_at": "2026-01-09T10:28:59.999749",
+    "updated_at": "2026-01-09T10:28:59.999749",
+    "memory_layer": "shareable",
+    "tags": [
+      "Personal",
+      "Academic"
+    ],
+    "reflection": null,
+    "outcome_status": null
+  },
+  "dec_1a096c8a": {
+    "id": "dec_1a096c8a",
+    "title": "JOB TRANSITION",
+    "description": "i want to transition my career from java to python developer\n\n",
+    "goal": "To enhance my skill and get a high salary\n",  
+    "constraints": [
+      {
+        "category": "Cost",
+        "description": "The course fee is so high",
+        "severity": "Low"
+      }
+    ],
+    "alternatives": [
+      {
+        "option": "java ",
+        "pros": [
+          "Fast",
+          "Cost-effective"
+        ],
+        "cons": [
+          "Learning curve"
+        ],
+        "rejected_reason": "java is more complex to learn"
+      }
+    ],
+    "final_choice": " i will learn python and get ready for job",
+    "reasoning": "python is easy to learn and also less complex and offer a good salary\n",
+    "expected_outcome": "To become a job ready pogrammer in 30 days",
+    "related_decisions": [],
+    "created_at": "2026-01-12T17:44:08.678989",
+    "updated_at": "2026-01-12T17:46:29.108807",
+    "memory_layer": "shareable",
+    "tags": [
+      "Personal",
+      "Career",
+      "Technical"
+    ],
+    "reflection": "this is an outstanding decission and i am happy by learning it",
+    "outcome_status": "Completed"
+  },
+  "dec_48676cda": {
+    "id": "dec_48676cda",
+    "title": "job switching",
+    "description": "i want to transition my career from java to python developer",
+    "goal": " To enhance my skill and get a high salary",
+    "constraints": [
+      {
+        "category": "Time",
+        "description": "6 month",
+        "severity": "Medium"
+      }
+    ],
+    "alternatives": [
+      {
+        "option": "java",
+        "pros": [
+          "Scalable",
+          "Fast"
+        ],
+        "cons": [
+          "Complex"
+        ],
+        "rejected_reason": "it is need more time"
+      }
+    ],
+    "final_choice": "i want to learn python",
+    "reasoning": "cost effective",
+    "expected_outcome": "i can have more salary expectation",
+    "related_decisions": [],
+    "created_at": "2026-01-13T15:26:47.299144",
+    "updated_at": "2026-01-13T15:26:47.299144",
+    "memory_layer": "shareable",
+    "tags": [
+      "Career",
+      "Technical",
+      "Academic"
+    ],
+    "reflection": null,
+    "outcome_status": null
+  }
+}
